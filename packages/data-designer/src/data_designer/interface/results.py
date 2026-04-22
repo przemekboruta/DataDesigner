@@ -6,6 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, get_args
 
+import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.analysis.dataset_profiler import DatasetProfilerResults
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.dataset_metadata import DatasetMetadata
@@ -99,40 +100,55 @@ class DatasetCreationResults(WithRecordSamplerMixin):
             raise ArtifactStorageError(f"Processor {processor_name} has no artifacts.")
         return self.artifact_storage.processors_outputs_path / processor_name
 
-    def export(self, path: Path | str, *, format: ExportFormat = "jsonl") -> Path:
-        """Export the generated dataset to a single file.
+    def export(self, path: Path | str, *, format: ExportFormat | None = None) -> Path:
+        """Export the generated dataset to a single file by streaming batch files.
+
+        The output format is inferred from the file extension when *format* is
+        omitted.  Pass *format* explicitly to override the extension (e.g. write a
+        ``.txt`` file as JSONL).
+
+        Unlike :meth:`load_dataset`, this method never materialises the full dataset
+        in memory — it reads batch parquet files one at a time and appends each to
+        the output file, keeping peak memory proportional to a single batch.
 
         Args:
-            path: Output file path. The extension is not inferred from *format* —
-                the exact path is used as-is.
+            path: Output file path. The exact path is used as-is; the extension is
+                not rewritten.
             format: Output format. One of ``'jsonl'``, ``'csv'``, or ``'parquet'``.
-                Defaults to ``'jsonl'``.
+                When omitted, the format is inferred from the file extension.
 
         Returns:
             Path to the written file.
 
         Raises:
-            InvalidFileFormatError: If an unsupported format is requested.
+            InvalidFileFormatError: If the format cannot be determined or is not
+                one of the supported values.
+            ArtifactStorageError: If no batch parquet files are found.
 
         Example:
             >>> results = data_designer.create(config, num_records=1000)
             >>> results.export("output.jsonl")
             PosixPath('output.jsonl')
-            >>> results.export("output.csv", format="csv")
+            >>> results.export("output.csv")
             PosixPath('output.csv')
+            >>> results.export("output.txt", format="jsonl")
+            PosixPath('output.txt')
         """
-        if format not in SUPPORTED_EXPORT_FORMATS:
-            raise InvalidFileFormatError(
-                f"Unsupported export format: {format!r}. Choose one of: {', '.join(SUPPORTED_EXPORT_FORMATS)}."
-            )
         path = Path(path)
-        df = self.load_dataset()
-        if format == "jsonl":
-            df.to_json(path, orient="records", lines=True, force_ascii=False, date_format="iso")
-        elif format == "csv":
-            df.to_csv(path, index=False)
-        elif format == "parquet":
-            df.to_parquet(path, index=False)
+        resolved_format: str = format if format is not None else path.suffix.lstrip(".")
+        if resolved_format not in SUPPORTED_EXPORT_FORMATS:
+            raise InvalidFileFormatError(
+                f"Unsupported export format: {resolved_format!r}. Choose one of: {', '.join(SUPPORTED_EXPORT_FORMATS)}."
+            )
+        batch_files = sorted(self.artifact_storage.final_dataset_path.glob("batch_*.parquet"))
+        if not batch_files:
+            raise ArtifactStorageError("No batch parquet files found to export.")
+        if resolved_format == "jsonl":
+            _export_jsonl(batch_files, path)
+        elif resolved_format == "csv":
+            _export_csv(batch_files, path)
+        elif resolved_format == "parquet":
+            _export_parquet(batch_files, path)
         return path
 
     def push_to_hub(
@@ -180,3 +196,39 @@ class DatasetCreationResults(WithRecordSamplerMixin):
             description=description,
             tags=tags,
         )
+
+
+def _export_jsonl(batch_files: list[Path], output: Path) -> None:
+    """Write *batch_files* to *output* as JSONL, one record per line.
+
+    Each batch is appended in turn so peak memory stays proportional to one batch.
+    """
+    with output.open("w", encoding="utf-8") as f:
+        for batch_file in batch_files:
+            chunk = lazy.pd.read_parquet(batch_file)
+            content = chunk.to_json(orient="records", lines=True, force_ascii=False, date_format="iso")
+            f.write(content)
+            if not content.endswith("\n"):
+                f.write("\n")
+
+
+def _export_csv(batch_files: list[Path], output: Path) -> None:
+    """Write *batch_files* to *output* as CSV with a single header row."""
+    for i, batch_file in enumerate(batch_files):
+        chunk = lazy.pd.read_parquet(batch_file)
+        chunk.to_csv(output, mode="a" if i > 0 else "w", header=(i == 0), index=False)
+
+
+def _export_parquet(batch_files: list[Path], output: Path) -> None:
+    """Write *batch_files* to *output* as a single Parquet file.
+
+    Schemas are unified across batches before writing so that columns with minor
+    type drift (e.g. ``int64`` vs ``float64`` across batches) are cast to a
+    consistent schema rather than causing a write error.
+    """
+    schemas = [lazy.pq.read_schema(f) for f in batch_files]
+    unified_schema = lazy.pa.unify_schemas(schemas)
+    with lazy.pq.ParquetWriter(output, unified_schema) as writer:
+        for batch_file in batch_files:
+            table = lazy.pq.read_table(batch_file)
+            writer.write_table(table.cast(unified_schema))

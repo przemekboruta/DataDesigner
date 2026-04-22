@@ -171,7 +171,7 @@ class GenerationController:
         if output_format is not None:
             export_path = results.artifact_storage.base_dataset_path / f"dataset.{output_format}"
             try:
-                results.export(export_path, format=output_format)  # type: ignore[arg-type]
+                results.export(export_path)
             except Exception as e:
                 print_error(f"Export failed: {e}")
                 raise typer.Exit(code=1)

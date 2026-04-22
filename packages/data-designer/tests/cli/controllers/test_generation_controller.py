@@ -795,7 +795,6 @@ def test_run_create_with_output_format_happy_path(mock_load_config: MagicMock, m
 
     mock_results.export.assert_called_once_with(
         Path("/output/artifacts/dataset") / "dataset.jsonl",
-        format="jsonl",
     )
 
 
