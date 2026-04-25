@@ -30,9 +30,7 @@ def _make_mock_preview_results(num_records: int) -> MagicMock:
 def _make_mock_create_results(num_records: int, base_path: str = "/output/artifacts/dataset") -> MagicMock:
     """Create a mock CreateResults with the given number of records."""
     mock_results = MagicMock()
-    mock_dataset = MagicMock()
-    mock_dataset.__len__ = MagicMock(return_value=num_records)
-    mock_results.load_dataset.return_value = mock_dataset
+    mock_results.count_records.return_value = num_records
     mock_results.artifact_storage.base_dataset_path = base_path
     return mock_results
 
@@ -796,20 +794,6 @@ def test_run_create_with_output_format_happy_path(mock_load_config: MagicMock, m
     mock_results.export.assert_called_once_with(
         Path("/output/artifacts/dataset") / "dataset.jsonl",
     )
-
-
-def test_run_create_invalid_output_format_exits() -> None:
-    """Bad --output-format exits with code 1 before generation starts."""
-    controller = GenerationController()
-    with pytest.raises(typer.Exit) as exc_info:
-        controller.run_create(
-            config_source="config.yaml",
-            num_records=10,
-            dataset_name="dataset",
-            artifact_path=None,
-            output_format="xlsx",
-        )
-    assert exc_info.value.exit_code == 1
 
 
 @patch(f"{_CTRL}.DataDesigner")

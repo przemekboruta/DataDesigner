@@ -128,14 +128,6 @@ class GenerationController:
             output_format: If set, export the dataset to a single file in this format after
                 generation. One of 'jsonl', 'csv', 'parquet'.
         """
-        from data_designer.interface.results import SUPPORTED_EXPORT_FORMATS
-
-        if output_format is not None and output_format not in SUPPORTED_EXPORT_FORMATS:
-            print_error(
-                f"Unsupported export format: {output_format!r}. Choose one of: {', '.join(SUPPORTED_EXPORT_FORMATS)}."
-            )
-            raise typer.Exit(code=1)
-
         config_builder = self._load_config(config_source)
 
         resolved_artifact_path = Path(artifact_path) if artifact_path else Path.cwd() / "artifacts"
@@ -158,7 +150,7 @@ class GenerationController:
             print_error(f"Dataset creation failed: {e}")
             raise typer.Exit(code=1)
 
-        num_records = len(results.load_dataset())
+        num_records = results.count_records()
 
         analysis = results.load_analysis()
         if analysis is not None:

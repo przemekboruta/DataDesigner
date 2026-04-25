@@ -383,6 +383,36 @@ def test_export_no_batch_files_raises(stub_dataset_creation_results, tmp_path) -
         stub_dataset_creation_results.export(tmp_path / "out.jsonl")
 
 
+def test_count_records(stub_dataset_creation_results, stub_dataframe, stub_batch_dir) -> None:
+    """count_records() returns the total row count without loading data pages."""
+    stub_dataset_creation_results.artifact_storage.final_dataset_path = stub_batch_dir
+    assert stub_dataset_creation_results.count_records() == len(stub_dataframe)
+
+
+def test_export_uppercase_extension_is_recognised(stub_dataset_creation_results, stub_batch_dir, tmp_path) -> None:
+    """export() treats file extensions case-insensitively (e.g. .JSONL → jsonl)."""
+    stub_dataset_creation_results.artifact_storage.final_dataset_path = stub_batch_dir
+    out = tmp_path / "out.JSONL"
+    result = stub_dataset_creation_results.export(out)
+    assert result == out
+    assert out.exists()
+    lines = out.read_text(encoding="utf-8").splitlines()
+    for line in lines:
+        json.loads(line)
+
+
+def test_export_parquet_incompatible_schemas_raises(stub_dataset_creation_results, tmp_path) -> None:
+    """_export_parquet wraps ArrowInvalid (incompatible column names) as InvalidFileFormatError."""
+    batch_dir = tmp_path / "parquet-files"
+    batch_dir.mkdir()
+    # Two batches with different column names — pa.unify_schemas raises ArrowInvalid.
+    lazy.pd.DataFrame({"col_a": [1, 2]}).to_parquet(batch_dir / "batch_00000.parquet", index=False)
+    lazy.pd.DataFrame({"col_b": [3, 4]}).to_parquet(batch_dir / "batch_00001.parquet", index=False)
+    stub_dataset_creation_results.artifact_storage.final_dataset_path = batch_dir
+    with pytest.raises(InvalidFileFormatError, match="Cannot unify batch schemas"):
+        stub_dataset_creation_results.export(tmp_path / "out.parquet")
+
+
 def test_export_returns_path_object(stub_dataset_creation_results, stub_batch_dir, tmp_path) -> None:
     """export() returns a Path regardless of whether str or Path was passed."""
     stub_dataset_creation_results.artifact_storage.final_dataset_path = stub_batch_dir
