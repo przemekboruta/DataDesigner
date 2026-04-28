@@ -15,12 +15,19 @@ from typing import TYPE_CHECKING, Any, Callable
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.column_configs import GenerationStrategy
 from data_designer.engine.context import current_row_group
+from data_designer.engine.dataset_builders.errors import DatasetGenerationError
+from data_designer.engine.dataset_builders.multi_column_configs import MultiColumnConfig
 from data_designer.engine.dataset_builders.utils.async_progress_reporter import (
     DEFAULT_REPORT_INTERVAL,
     AsyncProgressReporter,
 )
 from data_designer.engine.dataset_builders.utils.completion_tracker import CompletionTracker
 from data_designer.engine.dataset_builders.utils.progress_tracker import ProgressTracker
+from data_designer.engine.dataset_builders.utils.skip_evaluator import should_skip_column_for_record
+from data_designer.engine.dataset_builders.utils.skip_tracker import (
+    apply_skip_to_record,
+    strip_skip_metadata_from_records,
+)
 from data_designer.engine.dataset_builders.utils.sticky_progress_bar import StickyProgressBar
 from data_designer.engine.dataset_builders.utils.task_model import SliceRef, Task, TaskTrace
 from data_designer.engine.models.errors import (
@@ -210,6 +217,10 @@ class AsyncTaskScheduler:
             progress_bar=self._progress_bar,
         )
 
+    @property
+    def active_worker_count(self) -> int:
+        return sum(1 for t in self._worker_tasks if not t.done())
+
     def _spawn_worker(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task:
         """Create a tracked worker task that auto-removes itself on completion."""
         task = asyncio.create_task(coro)
@@ -259,33 +270,32 @@ class AsyncTaskScheduler:
             # Launch admission as a background task so it interleaves with dispatch.
             admission_task = asyncio.create_task(self._admit_row_groups())
 
+            dispatch_error: BaseException | None = None
             try:
                 # Main dispatch loop
                 await self._main_dispatch_loop(seed_cols, has_pre_batch, all_columns)
-
-                # Cancel admission if still running
-                if not admission_task.done():
-                    admission_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await admission_task
-
-                if self._reporter:
-                    self._reporter.log_final()
-
-                if self._rg_states:
-                    incomplete = list(self._rg_states)
-                    logger.error(
-                        f"Scheduler exited with {len(self._rg_states)} unfinished row group(s): {incomplete}. "
-                        "These row groups were not checkpointed."
-                    )
-
-            except asyncio.CancelledError:
+            except BaseException as exc:
+                dispatch_error = exc
+                raise
+            finally:
+                # Always cancel admission + drain in-flight workers, regardless
+                # of how the dispatch loop exited (normal, early shutdown,
+                # CancelledError, or processor failure).
                 if not admission_task.done():
                     admission_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await admission_task
                 await asyncio.shield(self._cancel_workers())
-                raise
+
+            if self._reporter:
+                self._reporter.log_final()
+
+            if self._rg_states and dispatch_error is None:
+                incomplete = list(self._rg_states)
+                logger.error(
+                    f"Scheduler exited with {len(self._rg_states)} unfinished row group(s): {incomplete}. "
+                    "These row groups were not checkpointed."
+                )
 
     async def _main_dispatch_loop(
         self,
@@ -494,29 +504,26 @@ class AsyncTaskScheduler:
             if self._tracker.is_row_group_complete(rg_id, state.size, all_columns)
         ]
         for rg_id, rg_size in completed:
-            dropped = False
             try:
-                del self._rg_states[rg_id]
                 if self._on_before_checkpoint:
                     try:
                         self._on_before_checkpoint(rg_id, rg_size)
-                    except Exception:
-                        # Post-batch is mandatory; drop rather than checkpoint unprocessed data.
-                        logger.error(
-                            f"on_before_checkpoint failed for row group {rg_id}, dropping row group.",
-                            exc_info=True,
-                        )
-                        self._drop_row_group(rg_id, rg_size)
-                        if self._buffer_manager:
-                            self._buffer_manager.free_row_group(rg_id)
-                        dropped = True
+                    except DatasetGenerationError:
+                        raise
+                    except Exception as exc:
+                        raise DatasetGenerationError(
+                            f"Post-batch processor failed for row group {rg_id}: {exc}"
+                        ) from exc
+                # Remove from tracking only after the callback succeeds.
+                del self._rg_states[rg_id]
                 # If all rows were dropped (e.g. seed failure), free instead of finalizing
-                if not dropped and all(self._tracker.is_dropped(rg_id, ri) for ri in range(rg_size)):
+                if all(self._tracker.is_dropped(rg_id, ri) for ri in range(rg_size)):
                     if self._buffer_manager:
                         self._buffer_manager.free_row_group(rg_id)
-                    dropped = True
-                if not dropped and self._on_finalize_row_group is not None:
+                elif self._on_finalize_row_group is not None:
                     self._on_finalize_row_group(rg_id)
+            except DatasetGenerationError:
+                raise
             except Exception:
                 logger.error(f"Failed to checkpoint row group {rg_id}.", exc_info=True)
             finally:
@@ -537,19 +544,19 @@ class AsyncTaskScheduler:
                     if self._on_seeds_complete:
                         try:
                             self._on_seeds_complete(rg_id, state.size)
-                            # The callback may drop rows (e.g. pre-batch filtering).
-                            # Record skipped tasks for any newly-dropped rows so
-                            # progress reporting stays accurate.
-                            if self._reporter:
-                                for ri in range(state.size):
-                                    if self._tracker.is_dropped(rg_id, ri):
-                                        self._record_skipped_tasks_for_row(rg_id, ri)
-                        except Exception:
-                            logger.warning(
-                                f"Pre-batch processor failed for row group {rg_id}, skipping.",
-                                exc_info=True,
-                            )
-                            self._drop_row_group(rg_id, state.size)
+                        except DatasetGenerationError:
+                            raise
+                        except Exception as exc:
+                            raise DatasetGenerationError(
+                                f"Pre-batch processor failed for row group {rg_id}: {exc}"
+                            ) from exc
+                        # The callback may drop rows (e.g. pre-batch filtering).
+                        # Record skipped tasks for any newly-dropped rows so
+                        # progress reporting stays accurate.
+                        if self._reporter:
+                            for ri in range(state.size):
+                                if self._tracker.is_dropped(rg_id, ri):
+                                    self._record_skipped_tasks_for_row(rg_id, ri)
 
     def _drop_row(self, row_group: int, row_index: int, *, exclude_columns: set[str] | None = None) -> None:
         if self._tracker.is_dropped(row_group, row_index):
@@ -704,10 +711,11 @@ class AsyncTaskScheduler:
             if self._trace and trace:
                 trace.slot_acquired_at = time.perf_counter()
 
+            cell_skipped = False
             if task.task_type == "from_scratch":
                 await self._run_from_scratch(task, generator)
             elif task.task_type == "cell":
-                await self._run_cell(task, generator)
+                _result, cell_skipped = await self._run_cell(task, generator)
             elif task.task_type == "batch":
                 await self._run_batch(task, generator)
             else:
@@ -723,7 +731,10 @@ class AsyncTaskScheduler:
 
             self._check_error_rate(success=True)
             if self._reporter:
-                self._reporter.record_success(task.column)
+                if cell_skipped:
+                    self._reporter.record_skipped(task.column)
+                else:
+                    self._reporter.record_success(task.column)
             if self._trace and trace:
                 trace.status = "ok"
 
@@ -788,21 +799,29 @@ class AsyncTaskScheduler:
 
         return result_df
 
-    async def _run_cell(self, task: Task, generator: ColumnGenerator) -> Any:
-        """Execute a cell-by-cell task."""
+    async def _run_cell(self, task: Task, generator: ColumnGenerator) -> tuple[Any, bool]:
+        """Execute a cell-by-cell task. Returns ``(result, skipped)``."""
         if task.row_index is None:
             raise ValueError(f"Cell task requires a row_index, got None for column '{task.column}'")
 
         if self._tracker.is_dropped(task.row_group, task.row_index):
-            return None
+            return None, False
 
-        # Read row from buffer
+        # Evaluate skip against the live buffer record (no copy needed —
+        # there is no `await` between the read and the skip-metadata write).
         if self._buffer_manager is not None:
-            row_data = dict(self._buffer_manager.get_row(task.row_group, task.row_index))
+            record = self._buffer_manager.get_row(task.row_group, task.row_index)
         else:
-            row_data = {}
+            record = {}
 
-        result = await generator.agenerate(row_data)
+        if self._should_skip_record(task.column, record):
+            self._apply_skip_to_record(task, record)
+            skip_config = self._graph.get_skip_config(task.column)
+            return skip_config.value if skip_config is not None else None, True
+
+        # Copy for generation: agenerate crosses an await boundary, so the
+        # generator must not hold a mutable reference to the live record.
+        result = await generator.agenerate(dict(record))
 
         # Write back to buffer (include side-effect columns)
         if self._buffer_manager is not None and not self._tracker.is_dropped(task.row_group, task.row_index):
@@ -811,27 +830,73 @@ class AsyncTaskScheduler:
                 if col in result:
                     self._buffer_manager.update_cell(task.row_group, task.row_index, col, result[col])
 
-        return result
+        return result, False
+
+    def _should_skip_record(self, column: str, record: dict) -> bool:
+        """Decide whether a cell should be skipped (propagation first, then expression gate)."""
+        skip_config = self._graph.get_skip_config(column)
+        return should_skip_column_for_record(
+            record,
+            propagate_skip=self._graph.should_propagate_skip(column),
+            required_columns=self._graph.get_required_columns(column),
+            skip_config_when=skip_config.when if skip_config is not None else None,
+        )
+
+    def _apply_skip_to_record(self, task: Task, record: dict) -> None:
+        """Write skip metadata directly into *record* (the live buffer row)."""
+        skip_config = self._graph.get_skip_config(task.column)
+        skip_value = skip_config.value if skip_config is not None else None
+        apply_skip_to_record(
+            record,
+            column_name=task.column,
+            cell_value=skip_value,
+            side_effect_columns=self._graph.get_side_effect_columns(task.column),
+        )
 
     async def _run_batch(self, task: Task, generator: ColumnGenerator) -> Any:
         """Execute a full-column/batch task."""
+        rg_size = self._get_rg_size(task.row_group)
+
         if self._buffer_manager is not None:
-            batch_df = self._buffer_manager.get_dataframe(task.row_group)
-            # Snapshot dropped rows before the await so the row-count expectation
-            # is consistent with batch_df (concurrent tasks may drop rows during agenerate).
-            rg_size = self._get_rg_size(task.row_group)
             pre_dropped: set[int] = {ri for ri in range(rg_size) if self._buffer_manager.is_dropped(task.row_group, ri)}
+            active_rows_data: list[dict] = []
+
+            # Skip evaluation only applies to single-column configs.
+            # Multi-column configs (sampler/seed) are rejected by the SkipConfig
+            # model validator, so they never carry skip metadata.
+            pre_skipped: set[int] = set()
+            is_multi = isinstance(generator.config, MultiColumnConfig)
+            for ri in range(rg_size):
+                if ri in pre_dropped:
+                    continue
+
+                record = self._buffer_manager.get_row(task.row_group, ri)
+                if not is_multi and self._should_skip_record(task.column, record):
+                    self._apply_skip_to_record(task, record)
+                    pre_skipped.add(ri)
+                    continue
+
+                active_rows_data.append(record)
+
+            batch_df = (
+                lazy.pd.DataFrame(strip_skip_metadata_from_records(active_rows_data))
+                if active_rows_data
+                else lazy.pd.DataFrame()
+            )
         else:
             batch_df = lazy.pd.DataFrame()
-            rg_size = self._get_rg_size(task.row_group)
             pre_dropped = set()
+            pre_skipped = set()
+
+        if len(batch_df) == 0:
+            return batch_df
 
         result_df = await generator.agenerate(batch_df)
 
         # Merge result columns back to buffer (include side-effect columns)
         if self._buffer_manager is not None:
             write_cols = self._gen_instance_to_columns_including_side_effects.get(id(generator), [task.column])
-            active_rows = rg_size - len(pre_dropped)
+            active_rows = rg_size - len(pre_dropped) - len(pre_skipped)
             if len(result_df) != active_rows:
                 raise ValueError(
                     f"Batch generator for '{task.column}' returned {len(result_df)} rows "
@@ -839,9 +904,8 @@ class AsyncTaskScheduler:
                 )
             result_idx = 0
             for ri in range(rg_size):
-                if ri in pre_dropped:
+                if ri in pre_dropped or ri in pre_skipped:
                     continue
-                # Skip writing to rows dropped by concurrent tasks during the await
                 if not self._buffer_manager.is_dropped(task.row_group, ri):
                     for col in write_cols:
                         if col in result_df.columns:

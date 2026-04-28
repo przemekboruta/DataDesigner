@@ -25,7 +25,7 @@ from data_designer.config.models import (
     ModelProvider,
 )
 from data_designer.config.preview_results import PreviewResults
-from data_designer.config.run_config import RunConfig
+from data_designer.config.run_config import JinjaRenderingEngine, RunConfig
 from data_designer.config.utils.constants import (
     DEFAULT_NUM_RECORDS,
     MANAGED_ASSETS_PATH,
@@ -65,7 +65,7 @@ from data_designer.interface.errors import (
     DataDesignerProfilingError,
 )
 from data_designer.interface.results import DatasetCreationResults
-from data_designer.logging import RandomEmoji, configure_logging
+from data_designer.logging import LOG_INDENT, RandomEmoji, configure_logging
 from data_designer.plugins.plugin import PluginType
 from data_designer.plugins.registry import PluginRegistry
 
@@ -224,12 +224,15 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
             DataDesignerProfilingError: If an error occurs during dataset profiling.
         """
         logger.info("🎨 Creating Data Designer dataset")
+        self._log_jinja_rendering_engine_mode()
 
         resource_provider = self._create_resource_provider(dataset_name, config_builder, resume=resume)
 
         try:
             builder = self._create_dataset_builder(config_builder.build(), resource_provider)
             builder.build(num_records=num_records, resume=resume)
+        except DeprecationWarning:
+            raise
         except Exception as e:
             raise DataDesignerGenerationError(f"🛑 Error generating dataset: {e}") from e
 
@@ -295,12 +298,15 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
             DataDesignerProfilingError: If an error occurs during preview dataset profiling.
         """
         logger.info(f"{RandomEmoji.previewing()} Preview generation in progress")
+        self._log_jinja_rendering_engine_mode()
 
         resource_provider = self._create_resource_provider("preview-dataset", config_builder)
         try:
             builder = self._create_dataset_builder(config_builder.build(), resource_provider)
             raw_dataset = builder.build_preview(num_records=num_records)
             processed_dataset = builder.process_preview(raw_dataset)
+        except DeprecationWarning:
+            raise
         except Exception as e:
             raise DataDesignerGenerationError(f"🛑 Error generating preview dataset: {e}") from e
 
@@ -338,7 +344,13 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
             processor_artifacts=processor_artifacts,
             config_builder=config_builder,
             dataset_metadata=dataset_metadata,
+            task_traces=builder.task_traces or None,
         )
+
+    def _log_jinja_rendering_engine_mode(self) -> None:
+        engine = JinjaRenderingEngine(self._run_config.jinja_rendering_engine)
+        icon = "🔒" if engine == JinjaRenderingEngine.SECURE else "🏠"
+        logger.info(f"{LOG_INDENT}{icon} Jinja rendering engine: {engine.value}")
 
     def validate(self, config_builder: DataDesignerConfigBuilder) -> None:
         """Validate the Data Designer configuration as defined by the DataDesignerConfigBuilder

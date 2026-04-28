@@ -40,10 +40,11 @@ Preparation (`_prepare_async_run`):
 ### Execution Graph
 
 `ExecutionGraph` (in `dataset_builders/utils/execution_graph.py`) models column dependencies:
-- Upstream/downstream sets derived from `required_columns` and side-effect columns
+- Upstream/downstream sets derived from `required_columns`, side-effect columns, and `skip.when` references
 - `GenerationStrategy` per column (CELL_BY_CELL or FULL_COLUMN)
 - Kahn topological sort for execution order
 - `split_upstream_by_strategy` — separates batch-level from cell-level dependencies
+- Skip metadata per column — `get_skip_config`, `should_propagate_skip`, `get_required_columns`, and `get_side_effect_columns` — queried at runtime by both engines to evaluate skip decisions
 
 ### CompletionTracker
 
@@ -53,9 +54,24 @@ Tracks per-row-group, per-column completion state:
 - **Frontier**: computes ready tasks when backed by `ExecutionGraph`
 - Handles dropped rows and downstream task enqueuing
 
-### DAG (Config-Level)
+### Conditional Generation (Skip)
 
-`dataset_builders/utils/dag.py` provides `topologically_sort_column_configs` — builds a NetworkX graph from `required_columns` and side-effect columns, returns a topological ordering. Used by both execution modes for initial column ordering.
+Columns can be conditionally skipped per-row via `SkipConfig` (defined in `data_designer.config.base`). Two mechanisms control skipping:
+
+1. **Expression gate** — `skip=SkipConfig(when="{{ expr }}")` on a `SingleColumnConfig`. The Jinja2 expression is evaluated per-row; when truthy, the column is skipped for that row and the configured `value` (default `None`) is written instead of calling the generator.
+2. **Skip propagation** — when an upstream column was skipped, downstream columns auto-skip unless they set `propagate_skip=False`. Propagation checks `required_columns` against the row's `__internal_skipped_columns` set.
+
+Skip evaluation is handled by two utility modules:
+
+- **`skip_evaluator.py`** — `evaluate_skip_when` renders the expression in a `NativeSandboxedEnvironment` (native Python types, `StrictUndefined`). `should_skip_by_propagation` checks set intersection between required columns and skipped columns.
+- **`skip_tracker.py`** — manages the `__internal_skipped_columns` metadata key on record dicts. Each record carries a `__internal_skipped_columns` set listing which columns were skipped for that row. `apply_skip_to_record` adds the column name to that set, writes the skip value into the cell, and clears any side-effect columns. `strip_skip_metadata_from_records` removes the `__internal_skipped_columns` key before DataFrame construction so it never reaches parquet (called by `DatasetBatchManager`, `RowGroupBufferManager`, and inline in both engines).
+
+Both execution modes integrate skip at the same points:
+
+- **Sequential**: `_run_full_column_generator` and the fan-out methods (`_fan_out_with_threads`, `_fan_out_with_async`) call `_should_skip_cell` per record. Skipped rows are excluded from the generator input, then merged back with skip metadata preserved. A fast `_column_can_skip` check short-circuits the per-record evaluation when no skip config or propagation applies.
+- **Async**: `_run_cell` and `_run_batch` in `AsyncTaskScheduler` call `_should_skip_record` / `_apply_skip_to_record` with the same logic. Skipped cells report as skipped (not success) in progress tracking.
+
+DAG edges are added for `skip.when` column references in both `topologically_sort_column_configs` (compile-time sort) and `ExecutionGraph.create` (async runtime) so skip-gate columns are generated before the gated column.
 
 ### DatasetBatchManager
 
@@ -98,7 +114,7 @@ DatasetBuilder.build()
 - **Dual execution engines behind one API.** The sequential engine is simpler and easier to debug; the async engine adds row-group parallelism for throughput. Users switch via an environment variable without changing their code.
 - **DAG-driven ordering** ensures columns with dependencies (e.g., a judge column that depends on a text column) are generated in the correct order, regardless of the order they appear in the config.
 - **Salvage rounds in async mode** retry failed tasks after all other tasks in a round complete, improving resilience against transient LLM failures without blocking the entire generation.
-- **Separate config-level and runtime DAGs.** The config-level DAG (`dag.py`) determines column ordering; the runtime `ExecutionGraph` adds strategy-aware dependency tracking for the async scheduler.
+- **Unified DAG construction.** `topologically_sort_column_configs` (in `execution_graph.py`) determines column ordering using Kahn's algorithm; the runtime `ExecutionGraph` adds strategy-aware dependency tracking for the async scheduler.
 
 ## Cross-References
 
