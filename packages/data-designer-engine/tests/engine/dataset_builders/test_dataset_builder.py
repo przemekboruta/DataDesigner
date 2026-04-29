@@ -1063,6 +1063,36 @@ def test_build_resume_raises_on_buffer_size_mismatch(stub_resource_provider, stu
         builder.build(num_records=4, resume=True)
 
 
+def test_build_resume_raises_on_config_mismatch(stub_resource_provider, stub_test_config_builder, tmp_path):
+    """resume=True raises when the saved builder_config differs from the current config."""
+    dataset_dir = tmp_path / "dataset"
+    _write_metadata(dataset_dir, target_num_records=4, buffer_size=2, num_completed_batches=1, actual_num_records=2)
+    # Write a builder_config.json whose data_designer section differs from the real config
+    (dataset_dir / "builder_config.json").write_text(json.dumps({"data_designer": {"columns": []}}))
+
+    builder = _make_resume_builder(stub_resource_provider, stub_test_config_builder, tmp_path, buffer_size=2)
+    with pytest.raises(DatasetGenerationError, match="does not match the configuration used in the interrupted run"):
+        builder.build(num_records=4, resume=True)
+
+
+def test_build_resume_does_not_raise_when_config_matches(stub_resource_provider, stub_test_config_builder, tmp_path):
+    """resume=True does not raise when the saved builder_config matches the current config."""
+    from data_designer.config.config_builder import BuilderConfig
+
+    dataset_dir = tmp_path / "dataset"
+    _write_metadata(dataset_dir, target_num_records=4, buffer_size=2, num_completed_batches=1, actual_num_records=2)
+
+    builder = _make_resume_builder(stub_resource_provider, stub_test_config_builder, tmp_path, buffer_size=2)
+    # Write a builder_config.json that matches the current config exactly
+    matching_config = BuilderConfig(data_designer=builder._data_designer_config)
+    matching_config.to_json(dataset_dir / "builder_config.json")
+
+    with patch.object(builder, "_run_batch"):
+        with patch.object(builder.batch_manager, "finish"):
+            # Should not raise — configs are identical
+            builder.build(num_records=4, resume=True)
+
+
 def test_build_resume_logs_warning_when_already_complete(
     stub_resource_provider, stub_test_config_builder, tmp_path, caplog
 ):
@@ -1280,6 +1310,7 @@ def test_initial_actual_num_records_from_filesystem_in_crash_window(
         mock_scheduler = Mock()
         mock_scheduler.traces = []
         mock_buffer_manager = Mock()
+        mock_buffer_manager.actual_num_records = 6  # must be an int for partial-completion check
         return mock_scheduler, mock_buffer_manager
 
     mock_future = Mock()

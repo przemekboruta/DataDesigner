@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import enum
 import functools
+import json
 import logging
 import os
 import re
@@ -202,6 +203,8 @@ class DatasetBuilder:
         """
         self._run_model_health_check_if_needed()
         self._run_mcp_tool_check_if_needed()
+        if resume:
+            self._check_resume_config_compatibility()
         self._write_builder_config()
 
         # Set media storage mode based on parameters
@@ -534,7 +537,6 @@ class DatasetBuilder:
 
         # Write final metadata (overwrites the last incremental write with identical content).
         buffer_manager.write_metadata(target_num_records=num_records, buffer_size=buffer_size)
-        return _GenerationOutcome.GENERATED
 
         # Surface partial completion
         actual = buffer_manager.actual_num_records
@@ -544,6 +546,8 @@ class DatasetBuilder:
                 f"⚠️ Generated {actual} of {num_records} requested records ({pct:.0f}%). "
                 "The dataset may be incomplete due to errors or early shutdown."
             )
+
+        return _GenerationOutcome.GENERATED
 
     def _prepare_async_run(
         self,
@@ -680,6 +684,38 @@ class DatasetBuilder:
         BuilderConfig(data_designer=self._data_designer_config).to_json(
             self.artifact_storage.base_dataset_path / SDG_CONFIG_FILENAME
         )
+
+    def _check_resume_config_compatibility(self) -> None:
+        """Raise DatasetGenerationError if the current config differs from the saved one.
+
+        Called before ``_write_builder_config()`` overwrites the file so that the original
+        config is still readable. ``library_version`` is excluded from the comparison —
+        package upgrades between runs should not block a resume.
+
+        Raises:
+            DatasetGenerationError: If a saved ``builder_config.json`` exists and its
+                ``data_designer`` section does not match the current configuration.
+        """
+        config_path = self.artifact_storage.base_dataset_path / SDG_CONFIG_FILENAME
+        if not config_path.exists():
+            return
+        try:
+            saved = json.loads(config_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return  # unreadable config — skip check rather than block the resume
+
+        saved_config = saved.get("data_designer")
+        if saved_config is None:
+            # No data_designer section — file is a placeholder or an old format; skip check.
+            return
+        current = BuilderConfig(data_designer=self._data_designer_config).to_dict()
+        if saved_config != current.get("data_designer"):
+            raise DatasetGenerationError(
+                "🛑 Cannot resume: the current column/model configuration does not match the "
+                "configuration used in the interrupted run. Resuming with a different config "
+                "would produce a dataset with inconsistent batches. Either restore the original "
+                "config or start a new run without resume=True."
+            )
 
     def _run_batch(
         self,
