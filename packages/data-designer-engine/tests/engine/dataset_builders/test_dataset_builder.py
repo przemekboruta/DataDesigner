@@ -23,7 +23,7 @@ from data_designer.config.sampler_params import SamplerType, UUIDSamplerParams
 from data_designer.config.seed_source import LocalFileSeedSource
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.column_generators.generators.base import GenerationStrategy
-from data_designer.engine.dataset_builders.dataset_builder import DatasetBuilder
+from data_designer.engine.dataset_builders.dataset_builder import DatasetBuilder, _GenerationOutcome
 from data_designer.engine.dataset_builders.errors import DatasetGenerationError, DatasetProcessingError
 from data_designer.engine.models.errors import (
     FormattedLLMErrorMessage,
@@ -1006,7 +1006,7 @@ def test_build_resume_starts_fresh_without_metadata(stub_resource_provider, stub
 
 
 def test_build_resume_raises_on_num_records_mismatch(stub_resource_provider, stub_test_config_builder, tmp_path):
-    """resume=True raises when num_records differs from the original run."""
+    """resume=True raises when num_records is less than the already-generated record count."""
     dataset_dir = tmp_path / "dataset"
     _write_metadata(
         dataset_dir,
@@ -1017,8 +1017,34 @@ def test_build_resume_raises_on_num_records_mismatch(stub_resource_provider, stu
     )
 
     builder = _make_resume_builder(stub_resource_provider, stub_test_config_builder, tmp_path, buffer_size=2)
-    with pytest.raises(DatasetGenerationError, match="num_records=4 does not match"):
-        builder.build(num_records=4, resume=True)
+    # num_records=2 < actual_num_records=4 → cannot resume
+    with pytest.raises(DatasetGenerationError, match="num_records=2 is less than the 4 records"):
+        builder.build(num_records=2, resume=True)
+
+
+def test_build_resume_runs_remaining_batches(stub_resource_provider, stub_test_config_builder, tmp_path):
+    """resume=True skips completed batches and runs only the remaining ones.
+
+    Scenario: 3 batches total (6 records, buffer_size=2), 1 already done.
+    Expected: _run_batch is called twice with current_batch_number=1 and 2, NOT 0.
+    """
+    dataset_dir = tmp_path / "dataset"
+    _write_metadata(
+        dataset_dir,
+        target_num_records=6,
+        buffer_size=2,
+        num_completed_batches=1,
+        actual_num_records=2,
+    )
+
+    builder = _make_resume_builder(stub_resource_provider, stub_test_config_builder, tmp_path, buffer_size=2)
+    with patch.object(builder, "_run_batch") as mock_run_batch:
+        with patch.object(builder.batch_manager, "finish"):
+            builder.build(num_records=6, resume=True)
+
+    called_batch_numbers = [call.kwargs.get("current_batch_number") for call in mock_run_batch.call_args_list]
+    assert called_batch_numbers == [1, 2], f"Expected batches [1, 2], got {called_batch_numbers}"
+    assert 0 not in called_batch_numbers, "Batch 0 was already complete and must be skipped"
 
 
 def test_build_resume_raises_on_buffer_size_mismatch(stub_resource_provider, stub_test_config_builder, tmp_path):
@@ -1156,11 +1182,11 @@ def test_build_async_resume_logs_warning_when_already_complete(
 def test_build_async_resume_starts_fresh_without_metadata(
     stub_resource_provider, stub_test_config_builder, tmp_path, caplog
 ):
-    """Async resume with no metadata.json logs an info message and starts fresh.
+    """Async resume with no metadata.json and no parquet files logs an info message and starts fresh.
 
-    Previously this raised DatasetGenerationError; now it silently restarts from row group 0.
-    The log is emitted in build() before dispatching to _build_async, so mocking _build_async
-    does not suppress the message.
+    Unlike the sync path (which resets resume=False in build()), the async path handles the
+    no-prior-state case entirely inside _build_async.  build() therefore passes resume=True
+    through unchanged; _build_async detects no metadata + no parquet files and starts fresh.
     """
     dataset_dir = tmp_path / "dataset"
     dataset_dir.mkdir()
@@ -1171,13 +1197,12 @@ def test_build_async_resume_starts_fresh_without_metadata(
     with caplog.at_level(logging.INFO):
         with patch.object(builder_mod, "DATA_DESIGNER_ASYNC_ENGINE", True):
             with patch.object(builder, "_run_model_health_check_if_needed"):
-                with patch.object(builder, "_build_async", return_value=True) as mock_async:
+                with patch.object(builder, "_build_async", return_value=_GenerationOutcome.GENERATED) as mock_async:
                     builder.build(num_records=4, resume=True)
 
-    # _build_async is called with resume=False because the no-metadata path resets the flag
+    # _build_async receives resume=True — the async path handles no-metadata internally
     _, kwargs = mock_async.call_args
-    assert kwargs.get("resume") is False
-    assert any("interrupted before any batch completed" in record.message for record in caplog.records)
+    assert kwargs.get("resume") is True
 
 
 def test_build_async_resume_already_complete_does_not_run_after_generation_processors(

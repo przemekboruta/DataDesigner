@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import enum
 import functools
 import logging
 import os
@@ -93,6 +94,13 @@ if DATA_DESIGNER_ASYNC_ENGINE:
 
 
 _CLIENT_VERSION: str = get_library_version()
+
+
+class _GenerationOutcome(enum.Enum):
+    """Return value of internal build helpers; controls post-generation processor dispatch."""
+
+    GENERATED = "generated"
+    ALREADY_COMPLETE = "already_complete"
 
 
 @dataclass
@@ -205,38 +213,39 @@ class DatasetBuilder:
         start_time = time.perf_counter()
         buffer_size = self._resource_provider.run_config.buffer_size
 
-        if resume and not self.artifact_storage.metadata_file_path.exists():
-            # No metadata.json means the previous run was interrupted before any batch (sync) or
-            # row group (async) completed.  Nothing to resume — discard any leftover partial
-            # results and start fresh.
-            logger.info(
-                "▶️ No metadata.json found — the previous run was interrupted before any batch "
-                "completed. Starting generation from the beginning."
-            )
-            self.artifact_storage.clear_partial_results()
-            resume = False
-
-        generated = True
+        status = _GenerationOutcome.GENERATED
         self._use_async = DATA_DESIGNER_ASYNC_ENGINE and self._resolve_async_compatibility()
         if self._use_async:
-            generated = self._build_async(generators, num_records, buffer_size, on_batch_complete, resume=resume)
-        elif resume:
-            generated = self._build_with_resume(generators, num_records, buffer_size, on_batch_complete)
+            # Async engine handles the no-metadata crash-window case internally via
+            # _find_completed_row_group_ids(), so resume is passed through unchanged.
+            status = self._build_async(generators, num_records, buffer_size, on_batch_complete, resume=resume)
         else:
-            group_id = uuid.uuid4().hex
-            self.batch_manager.start(num_records=num_records, buffer_size=buffer_size)
-            for batch_idx in range(self.batch_manager.num_batches):
-                logger.info(f"⏳ Processing batch {batch_idx + 1} of {self.batch_manager.num_batches}")
-                self._run_batch(
-                    generators,
-                    batch_mode="batch",
-                    group_id=group_id,
-                    current_batch_number=batch_idx,
-                    on_batch_complete=on_batch_complete,
+            if resume and not self.artifact_storage.metadata_file_path.exists():
+                # Sync engine has no filesystem-only recovery path — start fresh.
+                logger.info(
+                    "▶️ No metadata.json found — the previous run was interrupted before any batch "
+                    "completed. Starting generation from the beginning."
                 )
-            self.batch_manager.finish()
+                self.artifact_storage.clear_partial_results()
+                resume = False
 
-        if generated:
+            if resume:
+                status = self._build_with_resume(generators, num_records, buffer_size, on_batch_complete)
+            else:
+                group_id = uuid.uuid4().hex
+                self.batch_manager.start(num_records=num_records, buffer_size=buffer_size)
+                for batch_idx in range(self.batch_manager.num_batches):
+                    logger.info(f"⏳ Processing batch {batch_idx + 1} of {self.batch_manager.num_batches}")
+                    self._run_batch(
+                        generators,
+                        batch_mode="batch",
+                        group_id=group_id,
+                        current_batch_number=batch_idx,
+                        on_batch_complete=on_batch_complete,
+                    )
+                self.batch_manager.finish()
+
+        if status is _GenerationOutcome.GENERATED:
             self._processor_runner.run_after_generation(buffer_size)
         self._resource_provider.model_registry.log_model_usage(time.perf_counter() - start_time)
 
@@ -256,11 +265,11 @@ class DatasetBuilder:
                 "Run without resume=True to start a new generation."
             )
 
-        target = metadata.get("target_num_records")
-        if target != num_records:
+        actual = metadata.get("actual_num_records", 0)
+        if num_records < actual:
             raise DatasetGenerationError(
-                f"🛑 Cannot resume: num_records={num_records} does not match the original run's "
-                f"target_num_records={target}. Use the same num_records as the interrupted run, "
+                f"🛑 Cannot resume: num_records={num_records} is less than the {actual} records "
+                "already generated. Use a value >= the number of already-generated records, "
                 "or start a new run without resume=True."
             )
 
@@ -283,12 +292,12 @@ class DatasetBuilder:
         num_records: int,
         buffer_size: int,
         on_batch_complete: Callable[[Path], None] | None,
-    ) -> bool:
+    ) -> _GenerationOutcome:
         """Resume generation from the last completed batch.
 
         Returns:
-            False if the dataset was already complete (no new records generated),
-            True after successfully generating the remaining batches.
+            ALREADY_COMPLETE if the dataset was already complete (no new records generated),
+            GENERATED after successfully generating the remaining batches.
         """
         state = self._load_resume_state(num_records, buffer_size)
 
@@ -304,7 +313,7 @@ class DatasetBuilder:
                 "⚠️ Dataset is already complete — all batches were found in the existing artifact directory. "
                 "Nothing to resume. Remove resume=True if you want to generate a new dataset."
             )
-            return False
+            return _GenerationOutcome.ALREADY_COMPLETE
 
         logger.info(
             f"▶️ Resuming from batch {state.num_completed_batches + 1} of {self.batch_manager.num_batches} "
@@ -324,7 +333,7 @@ class DatasetBuilder:
                 on_batch_complete=on_batch_complete,
             )
         self.batch_manager.finish()
-        return True
+        return _GenerationOutcome.GENERATED
 
     def build_preview(self, *, num_records: int) -> pd.DataFrame:
         self._run_model_health_check_if_needed()
@@ -421,12 +430,12 @@ class DatasetBuilder:
         on_batch_complete: Callable[[Path], None] | None = None,
         *,
         resume: bool = False,
-    ) -> bool:
+    ) -> _GenerationOutcome:
         """Async task-queue builder path - dispatches tasks based on dependency readiness.
 
         Returns:
-            False if the dataset was already complete (no new records generated),
-            True after successfully running the scheduler.
+            ``_GenerationOutcome.ALREADY_COMPLETE`` if the dataset was already complete,
+            ``_GenerationOutcome.GENERATED`` after successfully running the scheduler.
         """
         logger.info("⚡ DATA_DESIGNER_ASYNC_ENGINE is enabled - using async task-queue builder")
 
@@ -438,32 +447,49 @@ class DatasetBuilder:
         initial_total_num_batches = 0
 
         if resume:
-            # Validate run-parameter compatibility only — the async path derives
-            # ground-truth state from the filesystem, not from the returned state object.
-            self._load_resume_state(num_records, buffer_size)
             completed_ids = self._find_completed_row_group_ids()
-            skip_row_groups = frozenset(completed_ids)
-            # Use filesystem as source of truth for both counters — metadata may lag by one
-            # row group if a crash occurred between move_partial_result_to_final_file_path
-            # and write_metadata.
-            initial_total_num_batches = len(completed_ids)
-            initial_actual_num_records = sum(
-                min(buffer_size, num_records - rg_id * buffer_size) for rg_id in completed_ids
-            )
-            self.artifact_storage.clear_partial_results()
+            has_metadata = self.artifact_storage.metadata_file_path.exists()
 
-            total_row_groups = -(-num_records // buffer_size)  # ceiling division
-            if len(completed_ids) >= total_row_groups:
-                logger.warning(
-                    "⚠️ Dataset is already complete — all row groups were found in the existing artifact "
-                    "directory. Nothing to resume. Remove resume=True if you want to generate a new dataset."
+            if not has_metadata and not completed_ids:
+                # No prior state at all — treat as a fresh start.
+                logger.info("▶️ No prior async progress found. Starting generation from the beginning.")
+                self.artifact_storage.clear_partial_results()
+            else:
+                state: _ResumeState | None = None
+                if has_metadata:
+                    # Validate run-parameter compatibility; use metadata for the completion count
+                    # so AFTER_GENERATION processor rewrites don't fool the check.
+                    state = self._load_resume_state(num_records, buffer_size)
+                else:
+                    logger.info(
+                        f"▶️ No metadata.json but {len(completed_ids)} parquet file(s) found — "
+                        "recovering from filesystem state."
+                    )
+
+                skip_row_groups = frozenset(completed_ids)
+                initial_total_num_batches = len(completed_ids)
+                initial_actual_num_records = sum(
+                    min(buffer_size, num_records - rg_id * buffer_size) for rg_id in completed_ids
                 )
-                return False
+                self.artifact_storage.clear_partial_results()
 
-            logger.info(
-                f"▶️ Resuming async run: {len(completed_ids)} of {total_row_groups} row group(s) already "
-                f"complete ({initial_actual_num_records} records), skipping them."
-            )
+                total_row_groups = -(-num_records // buffer_size)  # ceiling division
+                # Use whichever count is higher: the filesystem count is authoritative in the
+                # crash window (metadata lags by one row group), while the metadata count is
+                # authoritative after AFTER_GENERATION processors have overwritten parquet-files/.
+                meta_count = state.num_completed_batches if state is not None else 0
+                completed_count = max(meta_count, len(completed_ids))
+                if completed_count >= total_row_groups:
+                    logger.warning(
+                        "⚠️ Dataset is already complete — all row groups were found in the existing artifact "
+                        "directory. Nothing to resume. Remove resume=True if you want to generate a new dataset."
+                    )
+                    return _GenerationOutcome.ALREADY_COMPLETE
+
+                logger.info(
+                    f"▶️ Resuming async run: {len(completed_ids)} of {total_row_groups} row group(s) already "
+                    f"complete ({initial_actual_num_records} records), skipping them."
+                )
 
         def finalize_row_group(rg_id: int) -> None:
             def on_complete(final_path: Path | str | None) -> None:
@@ -508,7 +534,7 @@ class DatasetBuilder:
 
         # Write final metadata (overwrites the last incremental write with identical content).
         buffer_manager.write_metadata(target_num_records=num_records, buffer_size=buffer_size)
-        return True
+        return _GenerationOutcome.GENERATED
 
         # Surface partial completion
         actual = buffer_manager.actual_num_records
