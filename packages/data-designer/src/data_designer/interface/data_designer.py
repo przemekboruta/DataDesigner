@@ -25,7 +25,7 @@ from data_designer.config.models import (
     ModelProvider,
 )
 from data_designer.config.preview_results import PreviewResults
-from data_designer.config.run_config import RunConfig
+from data_designer.config.run_config import JinjaRenderingEngine, RunConfig
 from data_designer.config.utils.constants import (
     DEFAULT_NUM_RECORDS,
     MANAGED_ASSETS_PATH,
@@ -37,7 +37,7 @@ from data_designer.engine.analysis.dataset_profiler import DataDesignerDatasetPr
 from data_designer.engine.compiler import compile_data_designer_config
 from data_designer.engine.dataset_builders.dataset_builder import DatasetBuilder
 from data_designer.engine.mcp.io import list_tool_names
-from data_designer.engine.model_provider import resolve_model_provider_registry
+from data_designer.engine.model_provider import ModelProviderRegistry, resolve_model_provider_registry
 from data_designer.engine.resources.person_reader import (
     PersonReader,
     create_person_reader,
@@ -61,11 +61,12 @@ from data_designer.engine.secret_resolver import (
 )
 from data_designer.engine.storage.artifact_storage import ArtifactStorage
 from data_designer.interface.errors import (
+    DataDesignerEarlyShutdownError,
     DataDesignerGenerationError,
     DataDesignerProfilingError,
 )
 from data_designer.interface.results import DatasetCreationResults
-from data_designer.logging import RandomEmoji, configure_logging
+from data_designer.logging import LOG_INDENT, RandomEmoji, configure_logging
 from data_designer.plugins.plugin import PluginType
 from data_designer.plugins.registry import PluginRegistry
 
@@ -149,11 +150,20 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
         self._run_config = RunConfig()
         self._managed_assets_path = Path(managed_assets_path or MANAGED_ASSETS_PATH)
         self._person_reader = person_reader
-        self._model_providers = self._resolve_model_providers(model_providers)
+        # Only consult the YAML's `default:` key when we are also falling back to
+        # the YAML's `providers:` list. A user-supplied `model_providers` list
+        # owns its own default (first wins), so the YAML default must not leak
+        # in and either (a) hard-fail validation when the YAML names a provider
+        # absent from the supplied list or (b) silently override the
+        # documented first-wins ordering. See issue #588.
+        if model_providers is None:
+            self._model_providers = self._resolve_model_providers(None)
+            default_provider_name = get_default_provider_name()
+        else:
+            self._model_providers = self._resolve_model_providers(model_providers)
+            default_provider_name = None
         self._mcp_providers = mcp_providers or []
-        self._model_provider_registry = resolve_model_provider_registry(
-            self._model_providers, get_default_provider_name()
-        )
+        self._model_provider_registry = resolve_model_provider_registry(self._model_providers, default_provider_name)
         self._seed_reader_registry = SeedReaderRegistry(readers=seed_readers or DEFAULT_SEED_READERS)
 
     @property
@@ -217,12 +227,15 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
             DataDesignerProfilingError: If an error occurs during dataset profiling.
         """
         logger.info("🎨 Creating Data Designer dataset")
+        self._log_jinja_rendering_engine_mode()
 
         resource_provider = self._create_resource_provider(dataset_name, config_builder)
 
         try:
             builder = self._create_dataset_builder(config_builder.build(), resource_provider)
             builder.build(num_records=num_records)
+        except DeprecationWarning:
+            raise
         except Exception as e:
             raise DataDesignerGenerationError(f"🛑 Error generating dataset: {e}") from e
 
@@ -231,6 +244,20 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
         try:
             dataset_for_profiler = builder.artifact_storage.load_dataset_with_dropped_columns()
         except Exception as e:
+            # Distinguish "early shutdown produced zero records" from generic load failures
+            # so callers can react programmatically (e.g. retry on a different alias) instead
+            # of parsing a wrapped FileNotFoundError. The scheduler's structured signal lives
+            # on the builder for the duration of the run. We also require the run to have
+            # produced zero records: a partial-salvage run that fails to load for unrelated
+            # reasons (corrupt parquet, dropped-columns mismatch, filesystem hiccup) should
+            # surface the original cause, not a misleading "zero records" diagnosis.
+            if builder.early_shutdown and builder.actual_num_records == 0:
+                raise DataDesignerEarlyShutdownError(
+                    "🛑 Generation produced zero records — early shutdown was triggered. "
+                    "The non-retryable error rate exceeded the configured threshold; check the "
+                    "warnings above (and any 'Provider showing degraded performance' logs) for "
+                    "the contributing failures."
+                ) from e
             raise DataDesignerGenerationError(
                 f"🛑 Failed to load generated dataset — all records may have been dropped "
                 f"due to generation failures. Check the warnings above for details. Original error: {e}"
@@ -240,6 +267,15 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
         # practice load_dataset_with_dropped_columns() would raise before returning a
         # zero-row DataFrame. This guard protects against future changes to that contract.
         if len(dataset_for_profiler) == 0:
+            # Mirror the load-failure guard above: only raise the typed error when
+            # the run actually produced zero records. A partial-salvage run that
+            # somehow returns an empty DF for unrelated reasons should surface the
+            # generic error.
+            if builder.early_shutdown and builder.actual_num_records == 0:
+                raise DataDesignerEarlyShutdownError(
+                    "🛑 Dataset is empty — early shutdown was triggered before any records "
+                    "could complete. Check the warnings above for the contributing failures."
+                )
             raise DataDesignerGenerationError(
                 "🛑 Dataset is empty — all records were dropped due to generation failures. "
                 "Check the warnings above for details on which columns failed."
@@ -285,19 +321,32 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
 
         Raises:
             DataDesignerGenerationError: If an error occurs during preview dataset generation.
+            DataDesignerEarlyShutdownError: If preview terminated via the early-shutdown gate
+                with zero records produced. Subclass of ``DataDesignerGenerationError``.
             DataDesignerProfilingError: If an error occurs during preview dataset profiling.
         """
         logger.info(f"{RandomEmoji.previewing()} Preview generation in progress")
+        self._log_jinja_rendering_engine_mode()
 
         resource_provider = self._create_resource_provider("preview-dataset", config_builder)
         try:
             builder = self._create_dataset_builder(config_builder.build(), resource_provider)
             raw_dataset = builder.build_preview(num_records=num_records)
             processed_dataset = builder.process_preview(raw_dataset)
+        except DeprecationWarning:
+            raise
         except Exception as e:
             raise DataDesignerGenerationError(f"🛑 Error generating preview dataset: {e}") from e
 
         if len(processed_dataset) == 0:
+            # Mirror the create() path: distinguish "early shutdown produced zero
+            # records" from generic empty-dataset failures so callers can react
+            # programmatically.
+            if builder.early_shutdown and builder.actual_num_records == 0:
+                raise DataDesignerEarlyShutdownError(
+                    "🛑 Preview is empty — early shutdown was triggered before any records "
+                    "could complete. Check the warnings above for the contributing failures."
+                )
             raise DataDesignerGenerationError(
                 "🛑 Dataset is empty — all records were dropped due to generation or processing failures. "
                 "Check the warnings above for details on which columns failed."
@@ -331,7 +380,13 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
             processor_artifacts=processor_artifacts,
             config_builder=config_builder,
             dataset_metadata=dataset_metadata,
+            task_traces=builder.task_traces or None,
         )
+
+    def _log_jinja_rendering_engine_mode(self) -> None:
+        engine = JinjaRenderingEngine(self._run_config.jinja_rendering_engine)
+        icon = "🔒" if engine == JinjaRenderingEngine.SECURE else "🏠"
+        logger.info(f"{LOG_INDENT}{icon} Jinja rendering engine: {engine.value}")
 
     def validate(self, config_builder: DataDesignerConfigBuilder) -> None:
         """Validate the Data Designer configuration as defined by the DataDesignerConfigBuilder
@@ -376,6 +431,32 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
             The SecretResolver instance handling credentials and secrets.
         """
         return self._secret_resolver
+
+    @property
+    def model_provider_registry(self) -> ModelProviderRegistry:
+        """Get the resolved model provider registry.
+
+        Returns:
+            The ModelProviderRegistry containing the providers and default
+            resolved at construction time. The default is taken from the
+            first user-supplied provider when ``model_providers`` was passed
+            to the constructor; otherwise from the YAML's ``default:`` key
+            when set, falling back to the first provider in the YAML list.
+        """
+        return self._model_provider_registry
+
+    @property
+    def run_config(self) -> RunConfig:
+        """Get the runtime configuration applied to dataset generation.
+
+        Returns:
+            The active RunConfig instance. Note that ``RunConfig`` normalizes
+            some fields on construction (e.g., ``shutdown_error_rate`` becomes
+            ``1.0`` when ``disable_early_shutdown=True``), so the returned
+            object may not exactly equal the one originally passed to
+            ``set_run_config``.
+        """
+        return self._run_config
 
     def set_run_config(self, run_config: RunConfig) -> None:
         """Set the runtime configuration for dataset generation.

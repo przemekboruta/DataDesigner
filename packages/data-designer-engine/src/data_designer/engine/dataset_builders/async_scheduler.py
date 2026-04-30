@@ -15,20 +15,22 @@ from typing import TYPE_CHECKING, Any, Callable
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.column_configs import GenerationStrategy
 from data_designer.engine.context import current_row_group
+from data_designer.engine.dataset_builders.errors import DatasetGenerationError
+from data_designer.engine.dataset_builders.multi_column_configs import MultiColumnConfig
 from data_designer.engine.dataset_builders.utils.async_progress_reporter import (
     DEFAULT_REPORT_INTERVAL,
     AsyncProgressReporter,
 )
 from data_designer.engine.dataset_builders.utils.completion_tracker import CompletionTracker
 from data_designer.engine.dataset_builders.utils.progress_tracker import ProgressTracker
+from data_designer.engine.dataset_builders.utils.skip_evaluator import should_skip_column_for_record
+from data_designer.engine.dataset_builders.utils.skip_tracker import (
+    apply_skip_to_record,
+    strip_skip_metadata_from_records,
+)
 from data_designer.engine.dataset_builders.utils.sticky_progress_bar import StickyProgressBar
 from data_designer.engine.dataset_builders.utils.task_model import SliceRef, Task, TaskTrace
-from data_designer.engine.models.errors import (
-    ModelAPIConnectionError,
-    ModelInternalServerError,
-    ModelRateLimitError,
-    ModelTimeoutError,
-)
+from data_designer.engine.models.errors import RETRYABLE_MODEL_ERRORS
 
 if TYPE_CHECKING:
     from data_designer.engine.column_generators.generators.base import ColumnGenerator
@@ -40,12 +42,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_TASK_POOL_SIZE: int = 256
 LLM_WAIT_POOL_MULTIPLIER: int = 2
 
-_RETRYABLE_MODEL_ERRORS = (
-    ModelRateLimitError,
-    ModelTimeoutError,
-    ModelInternalServerError,
-    ModelAPIConnectionError,
-)
+# Degraded-provider WARN: emit at most one warning per interval when the
+# rolling fraction of retryable errors exceeds the threshold. Distinct from
+# the early-shutdown gate (which fires on non-retryable errors).
+# TODO: thread these through RunConfig so users can tune them per run.
+DEGRADED_WARN_RATE: float = 0.5
+DEGRADED_WARN_WINDOW: int = 20
+DEGRADED_WARN_INTERVAL_S: float = 60.0
 
 
 class TrackingSemaphore(asyncio.Semaphore):
@@ -98,6 +101,9 @@ class AsyncTaskScheduler:
         shutdown_error_rate: float = 0.5,
         shutdown_error_window: int = 10,
         disable_early_shutdown: bool = False,
+        degraded_warn_rate: float = DEGRADED_WARN_RATE,
+        degraded_warn_window: int = DEGRADED_WARN_WINDOW,
+        degraded_warn_interval_s: float = DEGRADED_WARN_INTERVAL_S,
         trace: bool = False,
         num_records: int = 0,
         buffer_size: int = 0,
@@ -131,11 +137,24 @@ class AsyncTaskScheduler:
         self._disable_early_shutdown = disable_early_shutdown
         self._early_shutdown = False
 
-        # Multi-column dedup: group output columns by generator identity
-        instance_to_columns: dict[int, list[str]] = {}
+        # Multi-column dedup: group output columns by generator identity.
+        # _gen_instance_to_columns holds only real (graph-registered) columns
+        # and is used for completion tracking.
+        # _gen_instance_to_columns_including_side_effects extends that with
+        # side-effect columns for buffer writes only.
+        gen_instance_to_columns: dict[int, list[str]] = {}
         for col, gen in generators.items():
-            instance_to_columns.setdefault(id(gen), []).append(col)
-        self._instance_to_columns = instance_to_columns
+            gen_instance_to_columns.setdefault(id(gen), []).append(col)
+        self._gen_instance_to_columns = gen_instance_to_columns
+
+        seen_cols: set[str] = {col for col in generators}
+        gen_instance_to_columns_incl_se: dict[int, list[str]] = {k: list(v) for k, v in gen_instance_to_columns.items()}
+        for col, gen in generators.items():
+            for side_effect_col in getattr(gen.config, "side_effect_columns", []):
+                if side_effect_col not in seen_cols:
+                    gen_instance_to_columns_incl_se.setdefault(id(gen), []).append(side_effect_col)
+                    seen_cols.add(side_effect_col)
+        self._gen_instance_to_columns_including_side_effects = gen_instance_to_columns_incl_se
 
         # Stateful generator tracking: instance_id → asyncio.Lock
         self._stateful_locks: dict[int, asyncio.Lock] = {}
@@ -156,6 +175,22 @@ class AsyncTaskScheduler:
         # Sliding window for error rate shutdown
         self._recent_outcomes: deque[bool] = deque(maxlen=shutdown_error_window)
         self._all_rgs_admitted = False
+
+        # Degraded-provider WARN: separate window tracking retryable-vs-not for
+        # every outcome (success or failure), throttled to one log per interval.
+        self._degraded_warn_rate = degraded_warn_rate
+        self._degraded_warn_window = degraded_warn_window
+        self._degraded_warn_interval_s = degraded_warn_interval_s
+        self._recent_retryable: deque[bool] = deque(maxlen=degraded_warn_window)
+        # Initialize to -inf so the first WARN is always emitted regardless of
+        # the monotonic clock's absolute value (which can be near-zero on freshly
+        # booted CI runners).
+        self._last_degraded_warn_at: float = float("-inf")
+
+        # Row groups that were partially salvaged after early shutdown
+        # (i.e., some rows complete, some incomplete-then-dropped). Surfaced
+        # via the partial_row_groups property as a structured signal.
+        self._partial_row_groups: list[int] = []
 
         # Pre-compute row-group sizes for O(1) lookup
         self._rg_size_map: dict[int, int] = dict(row_groups)
@@ -196,6 +231,24 @@ class AsyncTaskScheduler:
             report_interval=interval,
             progress_bar=self._progress_bar,
         )
+
+    @property
+    def active_worker_count(self) -> int:
+        return sum(1 for t in self._worker_tasks if not t.done())
+
+    @property
+    def early_shutdown(self) -> bool:
+        """True if the run terminated via the early-shutdown gate."""
+        return self._early_shutdown
+
+    @property
+    def partial_row_groups(self) -> tuple[int, ...]:
+        """Row group ids that were partially salvaged after early shutdown.
+
+        Empty unless ``early_shutdown`` is True. Each id had some rows
+        complete and the rest dropped before checkpointing.
+        """
+        return tuple(self._partial_row_groups)
 
     def _spawn_worker(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task:
         """Create a tracked worker task that auto-removes itself on completion."""
@@ -249,30 +302,32 @@ class AsyncTaskScheduler:
             try:
                 # Main dispatch loop
                 await self._main_dispatch_loop(seed_cols, has_pre_batch, all_columns)
-
-                # Cancel admission if still running
-                if not admission_task.done():
-                    admission_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await admission_task
-
-                if self._reporter:
-                    self._reporter.log_final()
-
-                if self._rg_states:
-                    incomplete = list(self._rg_states)
-                    logger.error(
-                        f"Scheduler exited with {len(self._rg_states)} unfinished row group(s): {incomplete}. "
-                        "These row groups were not checkpointed."
-                    )
-
-            except asyncio.CancelledError:
+            finally:
+                # Always cancel admission + drain in-flight workers, regardless
+                # of how the dispatch loop exited (normal, early shutdown,
+                # CancelledError, or processor failure).
                 if not admission_task.done():
                     admission_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await admission_task
                 await asyncio.shield(self._cancel_workers())
-                raise
+                # Salvage partially-complete row groups left over from early
+                # shutdown. Must run AFTER _cancel_workers - in-flight tasks
+                # could otherwise write into a buffer that's being finalized.
+                if self._early_shutdown and self._rg_states:
+                    self._finalize_after_shutdown(all_columns)
+
+            # Reached only on the clean-exit path; an exception in the
+            # dispatch loop or the finally block propagates and skips this.
+            if self._reporter:
+                self._reporter.log_final()
+
+            if self._rg_states:
+                incomplete = list(self._rg_states)
+                logger.error(
+                    f"Scheduler exited with {len(self._rg_states)} unfinished row group(s): {incomplete}. "
+                    "These row groups were not checkpointed."
+                )
 
     async def _main_dispatch_loop(
         self,
@@ -283,7 +338,7 @@ class AsyncTaskScheduler:
         """Core dispatch loop extracted from ``run()``."""
         while True:
             if self._early_shutdown:
-                logger.warning("Early shutdown triggered - error rate exceeded threshold")
+                logger.warning("Early shutdown triggered - non-retryable error rate exceeded threshold")
                 if self._deferred:
                     await self._salvage_stalled_row_groups(seed_cols, has_pre_batch, all_columns)
                 self._checkpoint_completed_row_groups(all_columns)
@@ -356,7 +411,7 @@ class AsyncTaskScheduler:
                     self._dispatched.discard(
                         Task(column=task.column, row_group=task.row_group, row_index=None, task_type="batch")
                     )
-                    for sibling in self._instance_to_columns.get(gid, []):
+                    for sibling in self._gen_instance_to_columns.get(gid, []):
                         if sibling != task.column:
                             self._dispatched.discard(
                                 Task(column=sibling, row_group=task.row_group, row_index=None, task_type="from_scratch")
@@ -377,7 +432,7 @@ class AsyncTaskScheduler:
                     )
                     # Re-mark sibling columns as dispatched to mirror _dispatch_seeds
                     # and prevent _drain_frontier from re-dispatching them.
-                    for sibling in self._instance_to_columns.get(gid, []):
+                    for sibling in self._gen_instance_to_columns.get(gid, []):
                         if sibling != task.column:
                             self._dispatched.add(
                                 Task(column=sibling, row_group=task.row_group, row_index=None, task_type="from_scratch")
@@ -481,29 +536,26 @@ class AsyncTaskScheduler:
             if self._tracker.is_row_group_complete(rg_id, state.size, all_columns)
         ]
         for rg_id, rg_size in completed:
-            dropped = False
             try:
-                del self._rg_states[rg_id]
                 if self._on_before_checkpoint:
                     try:
                         self._on_before_checkpoint(rg_id, rg_size)
-                    except Exception:
-                        # Post-batch is mandatory; drop rather than checkpoint unprocessed data.
-                        logger.error(
-                            f"on_before_checkpoint failed for row group {rg_id}, dropping row group.",
-                            exc_info=True,
-                        )
-                        self._drop_row_group(rg_id, rg_size)
-                        if self._buffer_manager:
-                            self._buffer_manager.free_row_group(rg_id)
-                        dropped = True
+                    except DatasetGenerationError:
+                        raise
+                    except Exception as exc:
+                        raise DatasetGenerationError(
+                            f"Post-batch processor failed for row group {rg_id}: {exc}"
+                        ) from exc
+                # Remove from tracking only after the callback succeeds.
+                del self._rg_states[rg_id]
                 # If all rows were dropped (e.g. seed failure), free instead of finalizing
-                if not dropped and all(self._tracker.is_dropped(rg_id, ri) for ri in range(rg_size)):
+                if all(self._tracker.is_dropped(rg_id, ri) for ri in range(rg_size)):
                     if self._buffer_manager:
                         self._buffer_manager.free_row_group(rg_id)
-                    dropped = True
-                if not dropped and self._on_finalize_row_group is not None:
+                elif self._on_finalize_row_group is not None:
                     self._on_finalize_row_group(rg_id)
+            except DatasetGenerationError:
+                raise
             except Exception:
                 logger.error(f"Failed to checkpoint row group {rg_id}.", exc_info=True)
             finally:
@@ -513,6 +565,44 @@ class AsyncTaskScheduler:
         if completed:
             checkpointed = {rg_id for rg_id, _ in completed}
             self._deferred = [t for t in self._deferred if t.row_group not in checkpointed]
+
+    def _finalize_after_shutdown(self, all_columns: list[str]) -> None:
+        """Salvage row groups left in flight when early shutdown fired.
+
+        For each remaining row group, drop rows that aren't fully complete
+        (and weren't already dropped); after that, ``is_row_group_complete``
+        is true by construction over the surviving rows, so delegating to
+        ``_checkpoint_completed_row_groups`` writes survivors and frees
+        zero-survivor groups via the buffer manager's existing logic.
+
+        Note on processors: ``_checkpoint_completed_row_groups`` calls
+        ``on_before_checkpoint`` (post-batch) but never ``on_seeds_complete``
+        (pre-batch). If the gate fires before seeds completed for a row
+        group, that row group's pre-batch processor never ran. Survivors
+        are checkpointed without it. This is the existing contract for
+        partial-row-group salvage.
+        """
+        for rg_id in list(self._rg_states.keys()):
+            rg_size = self._rg_states[rg_id].size
+            had_incomplete = False
+            for ri in range(rg_size):
+                if self._tracker.is_dropped(rg_id, ri):
+                    continue
+                if all(
+                    self._tracker.is_complete(SliceRef(column=col, row_group=rg_id, row_index=ri))
+                    for col in all_columns
+                ):
+                    continue
+                had_incomplete = True
+                self._drop_row(rg_id, ri)
+            if had_incomplete:
+                survivors = sum(1 for ri in range(rg_size) if not self._tracker.is_dropped(rg_id, ri))
+                if survivors > 0:
+                    self._partial_row_groups.append(rg_id)
+                    logger.warning(f"Row group {rg_id}: salvaging {survivors} of {rg_size} rows after early shutdown.")
+                else:
+                    logger.warning(f"Row group {rg_id}: 0 of {rg_size} rows survived early shutdown - skipping write.")
+        self._checkpoint_completed_row_groups(all_columns)
 
     def _run_seeds_complete_check(self, seed_cols: frozenset[str]) -> None:
         """Run pre-batch callbacks for row groups whose seeds just completed."""
@@ -524,19 +614,19 @@ class AsyncTaskScheduler:
                     if self._on_seeds_complete:
                         try:
                             self._on_seeds_complete(rg_id, state.size)
-                            # The callback may drop rows (e.g. pre-batch filtering).
-                            # Record skipped tasks for any newly-dropped rows so
-                            # progress reporting stays accurate.
-                            if self._reporter:
-                                for ri in range(state.size):
-                                    if self._tracker.is_dropped(rg_id, ri):
-                                        self._record_skipped_tasks_for_row(rg_id, ri)
-                        except Exception:
-                            logger.warning(
-                                f"Pre-batch processor failed for row group {rg_id}, skipping.",
-                                exc_info=True,
-                            )
-                            self._drop_row_group(rg_id, state.size)
+                        except DatasetGenerationError:
+                            raise
+                        except Exception as exc:
+                            raise DatasetGenerationError(
+                                f"Pre-batch processor failed for row group {rg_id}: {exc}"
+                            ) from exc
+                        # The callback may drop rows (e.g. pre-batch filtering).
+                        # Record skipped tasks for any newly-dropped rows so
+                        # progress reporting stays accurate.
+                        if self._reporter:
+                            for ri in range(state.size):
+                                if self._tracker.is_dropped(rg_id, ri):
+                                    self._record_skipped_tasks_for_row(rg_id, ri)
 
     def _drop_row(self, row_group: int, row_index: int, *, exclude_columns: set[str] | None = None) -> None:
         if self._tracker.is_dropped(row_group, row_index):
@@ -586,6 +676,35 @@ class AsyncTaskScheduler:
         if errors / self._shutdown_error_window >= self._shutdown_error_rate:
             self._early_shutdown = True
 
+    def _record_retryable_outcome(self, *, retryable: bool) -> None:
+        """Track retryable-error rate and emit a throttled WARN under provider degradation.
+
+        Distinct from ``_check_error_rate``: every LLM-bound task outcome (success
+        or failure) feeds this window so the rate reflects the provider's overall
+        health, not just the error mix. The call site filters on ``is_llm`` so
+        non-LLM tasks (samplers, expressions, non-LLM customs) don't dilute the
+        rate. Only retryable errors (rate-limit, timeout, 5xx, connection) count
+        toward the rate; non-retryable failures register as 0.
+        """
+        if self._degraded_warn_window <= 0:
+            return
+        self._recent_retryable.append(retryable)
+        if len(self._recent_retryable) < self._degraded_warn_window:
+            return
+        rate = sum(self._recent_retryable) / self._degraded_warn_window
+        if rate < self._degraded_warn_rate:
+            return
+        now = time.monotonic()
+        if now - self._last_degraded_warn_at < self._degraded_warn_interval_s:
+            return
+        self._last_degraded_warn_at = now
+        pct = int(round(rate * 100))
+        logger.warning(
+            f"Provider showing degraded performance: {pct}% of last {self._degraded_warn_window} "
+            "task outcomes were retryable errors (rate-limit, timeout, 5xx, connection). "
+            "Run may take longer than expected; salvage will retry these."
+        )
+
     async def _dispatch_seeds(self, rg_id: int, rg_size: int) -> None:
         """Dispatch from_scratch tasks for a row group."""
         self._rg_states[rg_id].seeds_dispatched = True
@@ -620,7 +739,7 @@ class AsyncTaskScheduler:
             self._dispatched.add(task)
             self._dispatched.add(batch_alias)
             # Also mark all sibling output columns as dispatched (multi-column dedup)
-            for sibling_col in self._instance_to_columns.get(gid, []):
+            for sibling_col in self._gen_instance_to_columns.get(gid, []):
                 if sibling_col != col:
                     self._dispatched.add(
                         Task(column=sibling_col, row_group=rg_id, row_index=None, task_type="from_scratch")
@@ -665,7 +784,7 @@ class AsyncTaskScheduler:
             trace.dispatched_at = time.perf_counter()
 
         generator = self._generators[task.column]
-        output_cols = self._instance_to_columns.get(id(generator), [task.column])
+        output_cols = self._gen_instance_to_columns.get(id(generator), [task.column])
         retryable = False
         # When True, skip removing from _dispatched so the task isn't re-dispatched
         # from the frontier (it was never completed, so it stays in the frontier).
@@ -691,10 +810,11 @@ class AsyncTaskScheduler:
             if self._trace and trace:
                 trace.slot_acquired_at = time.perf_counter()
 
+            cell_skipped = False
             if task.task_type == "from_scratch":
                 await self._run_from_scratch(task, generator)
             elif task.task_type == "cell":
-                await self._run_cell(task, generator)
+                _result, cell_skipped = await self._run_cell(task, generator)
             elif task.task_type == "batch":
                 await self._run_batch(task, generator)
             else:
@@ -709,15 +829,30 @@ class AsyncTaskScheduler:
                     self._tracker.mark_cell_complete(col, task.row_group, task.row_index)
 
             self._check_error_rate(success=True)
+            # The degraded-provider WARN is provider-scoped: only feed the
+            # window from LLM-bound tasks so a healthy non-model task mix
+            # (samplers, expressions, non-LLM customs) doesn't dilute the
+            # rate and silence the WARN under genuine provider stress.
+            if is_llm:
+                self._record_retryable_outcome(retryable=False)
             if self._reporter:
-                self._reporter.record_success(task.column)
+                if cell_skipped:
+                    self._reporter.record_skipped(task.column)
+                else:
+                    self._reporter.record_success(task.column)
             if self._trace and trace:
                 trace.status = "ok"
 
         except Exception as exc:
-            if not isinstance(exc, ModelRateLimitError):
-                self._check_error_rate(success=False)
             retryable = self._is_retryable(exc)
+            # Only non-retryable errors (auth, schema, code bugs) count toward
+            # the early-shutdown gate. Retryable errors (rate-limit, timeout,
+            # transient 5xx, connection blips) cluster under provider degradation
+            # and would otherwise trip the gate even when salvage could recover.
+            if not retryable:
+                self._check_error_rate(success=False)
+            if is_llm:
+                self._record_retryable_outcome(retryable=retryable)
             if not retryable and self._reporter:
                 self._reporter.record_failure(task.column)
             if self._trace and trace:
@@ -765,60 +900,114 @@ class AsyncTaskScheduler:
         else:
             result_df = await generator.agenerate(lazy.pd.DataFrame())
 
-        # Write results to buffer
+        # Write results to buffer (include side-effect columns)
         if self._buffer_manager is not None:
-            output_cols = self._instance_to_columns.get(id(generator), [task.column])
-            for col in output_cols:
+            write_cols = self._gen_instance_to_columns_including_side_effects.get(id(generator), [task.column])
+            for col in write_cols:
                 if col in result_df.columns:
                     values = result_df[col].tolist()
                     self._buffer_manager.update_batch(task.row_group, col, values)
 
         return result_df
 
-    async def _run_cell(self, task: Task, generator: ColumnGenerator) -> Any:
-        """Execute a cell-by-cell task."""
+    async def _run_cell(self, task: Task, generator: ColumnGenerator) -> tuple[Any, bool]:
+        """Execute a cell-by-cell task. Returns ``(result, skipped)``."""
         if task.row_index is None:
             raise ValueError(f"Cell task requires a row_index, got None for column '{task.column}'")
 
         if self._tracker.is_dropped(task.row_group, task.row_index):
-            return None
+            return None, False
 
-        # Read row from buffer
+        # Evaluate skip against the live buffer record (no copy needed —
+        # there is no `await` between the read and the skip-metadata write).
         if self._buffer_manager is not None:
-            row_data = dict(self._buffer_manager.get_row(task.row_group, task.row_index))
+            record = self._buffer_manager.get_row(task.row_group, task.row_index)
         else:
-            row_data = {}
+            record = {}
 
-        result = await generator.agenerate(row_data)
+        if self._should_skip_record(task.column, record):
+            self._apply_skip_to_record(task, record)
+            skip_config = self._graph.get_skip_config(task.column)
+            return skip_config.value if skip_config is not None else None, True
 
-        # Write back to buffer
+        # Copy for generation: agenerate crosses an await boundary, so the
+        # generator must not hold a mutable reference to the live record.
+        result = await generator.agenerate(dict(record))
+
+        # Write back to buffer (include side-effect columns)
         if self._buffer_manager is not None and not self._tracker.is_dropped(task.row_group, task.row_index):
-            output_cols = self._instance_to_columns.get(id(generator), [task.column])
-            for col in output_cols:
+            write_cols = self._gen_instance_to_columns_including_side_effects.get(id(generator), [task.column])
+            for col in write_cols:
                 if col in result:
                     self._buffer_manager.update_cell(task.row_group, task.row_index, col, result[col])
 
-        return result
+        return result, False
+
+    def _should_skip_record(self, column: str, record: dict) -> bool:
+        """Decide whether a cell should be skipped (propagation first, then expression gate)."""
+        skip_config = self._graph.get_skip_config(column)
+        return should_skip_column_for_record(
+            record,
+            propagate_skip=self._graph.should_propagate_skip(column),
+            required_columns=self._graph.get_required_columns(column),
+            skip_config_when=skip_config.when if skip_config is not None else None,
+        )
+
+    def _apply_skip_to_record(self, task: Task, record: dict) -> None:
+        """Write skip metadata directly into *record* (the live buffer row)."""
+        skip_config = self._graph.get_skip_config(task.column)
+        skip_value = skip_config.value if skip_config is not None else None
+        apply_skip_to_record(
+            record,
+            column_name=task.column,
+            cell_value=skip_value,
+            side_effect_columns=self._graph.get_side_effect_columns(task.column),
+        )
 
     async def _run_batch(self, task: Task, generator: ColumnGenerator) -> Any:
         """Execute a full-column/batch task."""
+        rg_size = self._get_rg_size(task.row_group)
+
         if self._buffer_manager is not None:
-            batch_df = self._buffer_manager.get_dataframe(task.row_group)
-            # Snapshot dropped rows before the await so the row-count expectation
-            # is consistent with batch_df (concurrent tasks may drop rows during agenerate).
-            rg_size = self._get_rg_size(task.row_group)
             pre_dropped: set[int] = {ri for ri in range(rg_size) if self._buffer_manager.is_dropped(task.row_group, ri)}
+            active_rows_data: list[dict] = []
+
+            # Skip evaluation only applies to single-column configs.
+            # Multi-column configs (sampler/seed) are rejected by the SkipConfig
+            # model validator, so they never carry skip metadata.
+            pre_skipped: set[int] = set()
+            is_multi = isinstance(generator.config, MultiColumnConfig)
+            for ri in range(rg_size):
+                if ri in pre_dropped:
+                    continue
+
+                record = self._buffer_manager.get_row(task.row_group, ri)
+                if not is_multi and self._should_skip_record(task.column, record):
+                    self._apply_skip_to_record(task, record)
+                    pre_skipped.add(ri)
+                    continue
+
+                active_rows_data.append(record)
+
+            batch_df = (
+                lazy.pd.DataFrame(strip_skip_metadata_from_records(active_rows_data))
+                if active_rows_data
+                else lazy.pd.DataFrame()
+            )
         else:
             batch_df = lazy.pd.DataFrame()
-            rg_size = self._get_rg_size(task.row_group)
             pre_dropped = set()
+            pre_skipped = set()
+
+        if len(batch_df) == 0:
+            return batch_df
 
         result_df = await generator.agenerate(batch_df)
 
-        # Merge result columns back to buffer
+        # Merge result columns back to buffer (include side-effect columns)
         if self._buffer_manager is not None:
-            output_cols = self._instance_to_columns.get(id(generator), [task.column])
-            active_rows = rg_size - len(pre_dropped)
+            write_cols = self._gen_instance_to_columns_including_side_effects.get(id(generator), [task.column])
+            active_rows = rg_size - len(pre_dropped) - len(pre_skipped)
             if len(result_df) != active_rows:
                 raise ValueError(
                     f"Batch generator for '{task.column}' returned {len(result_df)} rows "
@@ -826,11 +1015,10 @@ class AsyncTaskScheduler:
                 )
             result_idx = 0
             for ri in range(rg_size):
-                if ri in pre_dropped:
+                if ri in pre_dropped or ri in pre_skipped:
                     continue
-                # Skip writing to rows dropped by concurrent tasks during the await
                 if not self._buffer_manager.is_dropped(task.row_group, ri):
-                    for col in output_cols:
+                    for col in write_cols:
                         if col in result_df.columns:
                             self._buffer_manager.update_cell(task.row_group, ri, col, result_df.iloc[result_idx][col])
                 result_idx += 1
@@ -853,7 +1041,7 @@ class AsyncTaskScheduler:
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
         """Classify whether an exception is retryable."""
-        return isinstance(exc, _RETRYABLE_MODEL_ERRORS)
+        return isinstance(exc, RETRYABLE_MODEL_ERRORS)
 
 
 def build_llm_bound_lookup(generators: dict[str, ColumnGenerator]) -> dict[str, bool]:

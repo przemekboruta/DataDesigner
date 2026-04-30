@@ -30,10 +30,11 @@ def test_get_default_inference_parameters():
         top_p=0.95,
     )
     assert get_default_inference_parameters(
-        "reasoning", {"temperature": 0.35, "top_p": 0.95}
+        "reasoning", {"temperature": 1.0, "top_p": 0.95, "extra_body": {"reasoning_effort": "medium"}}
     ) == ChatCompletionInferenceParams(
-        temperature=0.35,
+        temperature=1.0,
         top_p=0.95,
+        extra_body={"reasoning_effort": "medium"},
     )
     assert get_default_inference_parameters(
         "vision", {"temperature": 0.85, "top_p": 0.95}
@@ -59,10 +60,10 @@ def test_get_builtin_model_configs():
     assert builtin_model_configs[0].model == "nvidia/nemotron-3-nano-30b-a3b"
     assert builtin_model_configs[0].provider == "nvidia"
     assert builtin_model_configs[1].alias == "nvidia-reasoning"
-    assert builtin_model_configs[1].model == "openai/gpt-oss-20b"
+    assert builtin_model_configs[1].model == "nvidia/nemotron-3-super-120b-a12b"
     assert builtin_model_configs[1].provider == "nvidia"
     assert builtin_model_configs[2].alias == "nvidia-vision"
-    assert builtin_model_configs[2].model == "nvidia/nemotron-nano-12b-v2-vl"
+    assert builtin_model_configs[2].model == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
     assert builtin_model_configs[2].provider == "nvidia"
     assert builtin_model_configs[3].alias == "nvidia-embedding"
     assert builtin_model_configs[3].model == "nvidia/llama-3.2-nv-embedqa-1b-v2"
@@ -100,14 +101,17 @@ def test_get_builtin_model_providers():
     assert builtin_model_providers[0].endpoint == "https://integrate.api.nvidia.com/v1"
     assert builtin_model_providers[0].provider_type == "openai"
     assert builtin_model_providers[0].api_key == "NVIDIA_API_KEY"
+    assert builtin_model_providers[0].extra_headers is None
     assert builtin_model_providers[1].name == "openai"
     assert builtin_model_providers[1].endpoint == "https://api.openai.com/v1"
     assert builtin_model_providers[1].provider_type == "openai"
     assert builtin_model_providers[1].api_key == "OPENAI_API_KEY"
+    assert builtin_model_providers[1].extra_headers is None
     assert builtin_model_providers[2].name == "openrouter"
     assert builtin_model_providers[2].endpoint == "https://openrouter.ai/api/v1"
     assert builtin_model_providers[2].provider_type == "openai"
     assert builtin_model_providers[2].api_key == "OPENROUTER_API_KEY"
+    assert builtin_model_providers[2].extra_headers is None
 
 
 def test_get_default_model_configs_path_exists(tmp_path: Path):
