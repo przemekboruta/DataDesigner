@@ -150,7 +150,7 @@ class GenerationController:
             print_error(f"Dataset creation failed: {e}")
             raise typer.Exit(code=1)
 
-        num_records = results.count_records()
+        actual_record_count = results.count_records()
 
         analysis = results.load_analysis()
         if analysis is not None:
@@ -161,16 +161,17 @@ class GenerationController:
         console.print(f"  Artifacts saved to: [bold]{results.artifact_storage.base_dataset_path}[/bold]")
 
         if output_format is not None:
-            export_path = Path(results.artifact_storage.base_dataset_path) / f"dataset.{output_format}"
+            export_path = Path(results.artifact_storage.base_dataset_path) / f"{dataset_name}.{output_format}"
             try:
                 results.export(export_path)
             except Exception as e:
+                export_path.unlink(missing_ok=True)
                 print_error(f"Export failed: {e}")
                 raise typer.Exit(code=1)
             console.print(f"  Exported to:       [bold]{export_path}[/bold]")
 
         console.print()
-        print_success(f"Dataset created — {num_records} record(s) generated")
+        print_success(f"Dataset created — {actual_record_count} record(s) generated")
         console.print()
 
     def _load_config(self, config_source: str) -> DataDesignerConfigBuilder:

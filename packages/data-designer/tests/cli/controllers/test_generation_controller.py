@@ -775,37 +775,41 @@ def test_run_create_skips_report_when_analysis_is_none(mock_load_config: MagicMo
 @patch(f"{_CTRL}.DataDesigner")
 @patch(f"{_CTRL}.load_config_builder")
 def test_run_create_with_output_format_happy_path(mock_load_config: MagicMock, mock_dd_cls: MagicMock) -> None:
-    """export() is called with the correct path and format when --output-format is given."""
+    """export() is called with the dataset-name-derived path when --output-format is given."""
     mock_load_config.return_value = MagicMock(spec=DataDesignerConfigBuilder)
     mock_dd = MagicMock()
     mock_dd_cls.return_value = mock_dd
-    mock_results = _make_mock_create_results(5)
+    mock_results = _make_mock_create_results(5, "/output/artifacts/my_data")
     mock_dd.create.return_value = mock_results
 
     controller = GenerationController()
     controller.run_create(
         config_source="config.yaml",
         num_records=5,
-        dataset_name="dataset",
+        dataset_name="my_data",
         artifact_path=None,
         output_format="jsonl",
     )
 
     mock_results.export.assert_called_once_with(
-        Path("/output/artifacts/dataset") / "dataset.jsonl",
+        Path("/output/artifacts/my_data") / "my_data.jsonl",
     )
 
 
 @patch(f"{_CTRL}.DataDesigner")
 @patch(f"{_CTRL}.load_config_builder")
-def test_run_create_export_failure_exits(mock_load_config: MagicMock, mock_dd_cls: MagicMock) -> None:
-    """If export() raises, run_create exits with code 1."""
+def test_run_create_export_failure_exits(mock_load_config: MagicMock, mock_dd_cls: MagicMock, tmp_path: Path) -> None:
+    """If export() raises, run_create cleans up the partial file and exits with code 1."""
     mock_load_config.return_value = MagicMock(spec=DataDesignerConfigBuilder)
     mock_dd = MagicMock()
     mock_dd_cls.return_value = mock_dd
-    mock_results = _make_mock_create_results(5)
+    mock_results = _make_mock_create_results(5, str(tmp_path))
     mock_results.export.side_effect = RuntimeError("disk full")
     mock_dd.create.return_value = mock_results
+
+    # Create a partial file to verify it gets cleaned up.
+    partial_file = tmp_path / "dataset.csv"
+    partial_file.write_text("partial")
 
     controller = GenerationController()
     with pytest.raises(typer.Exit) as exc_info:
@@ -817,3 +821,4 @@ def test_run_create_export_failure_exits(mock_load_config: MagicMock, mock_dd_cl
             output_format="csv",
         )
     assert exc_info.value.exit_code == 1
+    assert not partial_file.exists()

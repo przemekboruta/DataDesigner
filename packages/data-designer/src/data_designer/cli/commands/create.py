@@ -45,7 +45,7 @@ def create_command(
         help=(
             "Export the dataset to a single file after generation. "
             "Supported formats: jsonl, csv, parquet. "
-            "The file is written to <artifact-path>/<dataset-name>/dataset.<format>."
+            "The file is written to <artifact-path>/<dataset-name>/<dataset-name>.<format>."
         ),
     ),
 ) -> None:

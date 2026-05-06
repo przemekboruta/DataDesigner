@@ -219,10 +219,8 @@ def _export_jsonl(batch_files: list[Path], output: Path) -> None:
         for batch_file in batch_files:
             chunk = lazy.pd.read_parquet(batch_file)
             content = chunk.to_json(orient="records", lines=True, force_ascii=False, date_format="iso")
-            f.write(content)
-            if not content.endswith("\n"):
-                # Guard against empty batches where to_json() omits the trailing newline.
-                f.write("\n")
+            if content:
+                f.write(content)
 
 
 def _export_csv(batch_files: list[Path], output: Path) -> None:
@@ -247,12 +245,12 @@ def _export_parquet(batch_files: list[Path], output: Path) -> None:
     try:
         # promote_options="permissive" allows minor numeric type drift (e.g. int64 → double)
         unified_schema = lazy.pa.unify_schemas(schemas, promote_options="permissive")
-    except (lazy.pa.lib.ArrowInvalid, lazy.pa.lib.ArrowTypeError) as e:
+    except (lazy.pa.ArrowInvalid, lazy.pa.ArrowTypeError) as e:
         raise InvalidFileFormatError(f"Cannot unify batch schemas for parquet export: {e}") from e
     with lazy.pq.ParquetWriter(output, unified_schema) as writer:
         for batch_file in batch_files:
             table = lazy.pq.read_table(batch_file)
             try:
                 writer.write_table(table.cast(unified_schema))
-            except (lazy.pa.lib.ArrowInvalid, ValueError) as e:
+            except (lazy.pa.ArrowInvalid, ValueError) as e:
                 raise InvalidFileFormatError(f"Cannot cast batch {batch_file.name} to unified schema: {e}") from e
