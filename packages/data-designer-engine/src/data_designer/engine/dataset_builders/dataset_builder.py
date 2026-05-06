@@ -9,7 +9,6 @@ import logging
 import os
 import time
 import uuid
-import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -23,6 +22,7 @@ from data_designer.config.processors import (
     ProcessorConfig,
     ProcessorType,
 )
+from data_designer.config.utils.warning_helpers import warn_at_caller
 from data_designer.config.version import get_library_version
 from data_designer.engine.column_generators.generators.base import (
     ColumnGenerator,
@@ -66,17 +66,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DATA_DESIGNER_ASYNC_ENGINE = os.environ.get("DATA_DESIGNER_ASYNC_ENGINE", "0") == "1"
+# Async engine is the default execution path. Set ``DATA_DESIGNER_ASYNC_ENGINE=0``
+# to opt back into the legacy sync engine for one transitional release; the sync
+# path is scheduled for removal afterwards.
+DATA_DESIGNER_ASYNC_ENGINE = os.environ.get("DATA_DESIGNER_ASYNC_ENGINE", "1") == "1"
 
 if DATA_DESIGNER_ASYNC_ENGINE:
     import asyncio
-    import sys
 
-    if sys.version_info < (3, 11):
-        raise RuntimeError(
-            "DATA_DESIGNER_ASYNC_ENGINE requires Python 3.11+ (asyncio.TaskGroup). "
-            f"Current version: {sys.version_info.major}.{sys.version_info.minor}"
-        )
     from data_designer.engine.dataset_builders.async_scheduler import (
         DEFAULT_TASK_POOL_SIZE,
         LLM_WAIT_POOL_MULTIPLIER,
@@ -123,6 +120,10 @@ class DatasetBuilder:
         # ``-1`` means "no async run has executed yet" so callers can
         # distinguish "0 records produced" from "never ran".
         self._actual_num_records: int = -1
+        # First non-retryable error captured by the scheduler in the most recent
+        # async run, if any. Used by the interface to surface the original cause
+        # when a run produces 0 records due to deterministic failures.
+        self._first_non_retryable_error: Exception | None = None
 
         self._data_designer_config = compile_data_designer_config(data_designer_config, resource_provider)
         self._column_configs = compile_dataset_builder_column_configs(self._data_designer_config)
@@ -159,6 +160,11 @@ class DatasetBuilder:
     def actual_num_records(self) -> int:
         """Records actually written by the most recent async run (-1 if no run yet)."""
         return self._actual_num_records
+
+    @property
+    def first_non_retryable_error(self) -> Exception | None:
+        """First non-retryable error captured by the scheduler in the most recent run."""
+        return self._first_non_retryable_error
 
     def set_processor_runner(self, processors: list[Processor]) -> None:
         """Replace the processor runner with a new one using the given processors."""
@@ -271,6 +277,7 @@ class DatasetBuilder:
         self._early_shutdown = False
         self._partial_row_groups = ()
         self._actual_num_records = -1
+        self._first_non_retryable_error = None
         self._task_traces = []
 
     def _build_async_preview(self, generators: list[ColumnGenerator], num_records: int) -> pd.DataFrame:
@@ -297,6 +304,7 @@ class DatasetBuilder:
             self._early_shutdown = scheduler.early_shutdown
             self._partial_row_groups = scheduler.partial_row_groups
             self._actual_num_records = buffer_manager.actual_num_records
+            self._first_non_retryable_error = scheduler.first_non_retryable_error
 
         if not buffer_manager.has_row_group(0):
             return lazy.pd.DataFrame()
@@ -319,7 +327,17 @@ class DatasetBuilder:
                 "use workflow chaining instead (see issue #552)."
             )
             logger.warning(f"⚠️ {msg}")
-            warnings.warn(msg, DeprecationWarning, stacklevel=4)
+            # ``warn_at_caller`` rather than ``warnings.warn(stacklevel=N)`` so
+            # attribution lands on the user's call site instead of an internal
+            # ``DatasetBuilder.build`` / ``data_designer.interface`` frame.
+            # The exact internal-frame depth from this method up to user code
+            # depends on which entry point invoked the builder (build vs.
+            # build_preview, sync vs. async wrapping), so a hard-coded
+            # ``stacklevel`` is brittle; ``warn_at_caller`` walks past every
+            # ``data_designer.*`` frame regardless of chain shape. Library
+            # attribution would also be silenced under Python's default
+            # ``ignore::DeprecationWarning`` filter. See PR #594 review.
+            warn_at_caller(msg, DeprecationWarning)
             return False
         return True
 
@@ -371,6 +389,7 @@ class DatasetBuilder:
             self._early_shutdown = scheduler.early_shutdown
             self._partial_row_groups = scheduler.partial_row_groups
             self._actual_num_records = buffer_manager.actual_num_records
+            self._first_non_retryable_error = scheduler.first_non_retryable_error
 
         # Emit telemetry
         try:
